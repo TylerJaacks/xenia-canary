@@ -35,4 +35,7 @@ DECLARE_bool(break_condition_truncate);
 
 DECLARE_bool(break_on_debugbreak);
 
+// Guest-generated code (JIT runtimes such as the XNA/.NET CF host):
+DECLARE_bool(guest_code_generation);
+
 #endif  // XENIA_CPU_CPU_FLAGS_H_

@@ -58,6 +58,11 @@ class Backend {
   virtual void CommitExecutableRange(uint32_t guest_low,
                                      uint32_t guest_high) = 0;
 
+  // Points the indirection slot for |guest_address| back at the function
+  // resolver so the next call through it re-resolves (used when guest-
+  // generated code is invalidated). No-op outside the indirection window.
+  virtual void ResetIndirection(uint32_t guest_address) {}
+
   virtual std::unique_ptr<Assembler> CreateAssembler() = 0;
 
   virtual std::unique_ptr<GuestFunction> CreateGuestFunction(
@@ -93,6 +98,15 @@ class Backend {
 
   * */
   virtual void PrepareForReentry(void* ctx) {}
+
+  // Kernel user mode (KeEnterUserMode) runs guest code that later abandons
+  // its host frames by unwinding (KeLeaveUserMode). EnterNestedGuestStack
+  // records the backend's per-thread stack bookkeeping and pushes a barrier so
+  // the nested frames are never matched against the older ones (the user-mode
+  // stack is unrelated to the kernel stack). LeaveNestedGuestStack restores
+  // the recorded state after the unwind.
+  virtual uint32_t EnterNestedGuestStack(void* ctx) { return 0; }
+  virtual void LeaveNestedGuestStack(void* ctx, uint32_t saved_state) {}
 
   // returns true if populated st
   virtual bool PopulatePseudoStacktrace(GuestPseudoStackTrace* st) {

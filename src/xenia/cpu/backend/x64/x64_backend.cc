@@ -374,6 +374,10 @@ void X64Backend::CommitExecutableRange(uint32_t guest_low,
   code_cache_->CommitExecutableRange(guest_low, guest_high);
 }
 
+void X64Backend::ResetIndirection(uint32_t guest_address) {
+  code_cache_->ResetIndirection(guest_address);
+}
+
 std::unique_ptr<Assembler> X64Backend::CreateAssembler() {
   return std::make_unique<X64Assembler>(this);
 }
@@ -998,7 +1002,10 @@ void* X64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
 
   cmp(r10d, r9d);
 
-  jge(loopout, T_NEAR);
+  // Unsigned, like the scan in ResolveFunction that decided to come here:
+  // guest stacks may lie above 0x80000000, and nested-stack barriers use
+  // 0xFFFFFFFF.
+  jae(loopout, T_NEAR);
 
   inc(r12d);
 
@@ -1561,13 +1568,24 @@ void* X64HelperEmitter::EmitTryAcquireReservationHelper() {
   _code_offsets code_offsets = {};
   code_offsets.prolog = getSize();
 
-  Xbyak::Label already_has_a_reservation;
+  // As on PowerPC, a reserved load replaces the thread's previous
+  // reservation: code may abandon one (lwarx, compare, branch out without
+  // stwcx.), and a block bit left held would otherwise lock every other
+  // thread out of that block for good.
   Xbyak::Label acquire_new_reservation;
 
   btr(GetBackendFlagsPtr(), kX64BackendHasReserveBit);
   mov(r8, GetBackendCtxPtr(offsetof(X64BackendContext, reserve_helper_)));
-  jc(already_has_a_reservation);
+  jnc(acquire_new_reservation);
+  btr(GetBackendFlagsPtr(), kX64BackendOwnsReserveBit);
+  jnc(acquire_new_reservation);
+  mov(rdx,
+      GetBackendCtxPtr(offsetof(X64BackendContext, cached_reserve_offset)));
+  mov(r9d, GetBackendCtxPtr(offsetof(X64BackendContext, cached_reserve_bit)));
+  lock();
+  btr(qword[rdx], r9);
 
+  L(acquire_new_reservation);
   shr(ecx, RESERVE_BLOCK_SHIFT);
   xor_(r9d, r9d);
   mov(edx, ecx);
@@ -1577,10 +1595,11 @@ void* X64HelperEmitter::EmitTryAcquireReservationHelper() {
 
   lock();
   bts(qword[rdx], rcx);
-  // set flag on local backend context for thread to indicate our previous
-  // attempt to get the reservation succeeded
-  setnc(r9b);  // success = bitmap did not have a set bit at the idx
-  shl(r9b, kX64BackendHasReserveBit);
+  // The reservation is ours alone if the block's bit was clear; otherwise
+  // another thread holds the block and ours is shared.
+  setnc(r9b);
+  shl(r9d, kX64BackendOwnsReserveBit);
+  or_(r9d, 1 << kX64BackendHasReserveBit);
 
   mov(GetBackendCtxPtr(offsetof(X64BackendContext, cached_reserve_offset)),
       rdx);
@@ -1588,8 +1607,6 @@ void* X64HelperEmitter::EmitTryAcquireReservationHelper() {
 
   or_(GetBackendCtxPtr(offsetof(X64BackendContext, flags)), r9d);
   ret();
-  L(already_has_a_reservation);
-  DebugBreak();
 
   code_offsets.prolog_stack_alloc = getSize();
   code_offsets.body = getSize();
@@ -1605,7 +1622,9 @@ void* X64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   _code_offsets code_offsets = {};
   code_offsets.prolog = getSize();
   Xbyak::Label done;
+  Xbyak::Label shared_reservation;
   Xbyak::Label reservation_isnt_for_our_addr;
+  Xbyak::Label fail;
   Xbyak::Label somehow_double_cleared;
   // carry must be set + zero flag must be set
 
@@ -1644,7 +1663,10 @@ void* X64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   } else {
     cmpxchg(ptr[r9], r8d);
   }
-  // the ZF flag is unaffected by BTR! we exploit this for the retval
+  // the ZF flag is unaffected by BTR and STC! we exploit this for the retval
+
+  btr(GetBackendFlagsPtr(), kX64BackendOwnsReserveBit);
+  jnc(shared_reservation);
 
   // cancel our lock on the 65k block
   lock();
@@ -1660,10 +1682,23 @@ void* X64HelperEmitter::EmitReservedStoreHelper(bool bit64) {
   cmp(ax, 0x0101);
   ret();
 
-  // could be the same label, but otherwise we don't know where we came from
-  // when one gets triggered
+  L(shared_reservation);
+  stc();
+  jmp(done);
+
+  // A reserved store to another block than the reservation's: it fails, and
+  // the reservation is dropped.
   L(reservation_isnt_for_our_addr);
-  DebugBreak();
+  btr(GetBackendFlagsPtr(), kX64BackendOwnsReserveBit);
+  jnc(fail);
+  mov(rdx,
+      GetBackendCtxPtr(offsetof(X64BackendContext, cached_reserve_offset)));
+  mov(ecx, GetBackendCtxPtr(offsetof(X64BackendContext, cached_reserve_bit)));
+  lock();
+  btr(qword[rdx], rcx);
+  L(fail);
+  clc();
+  jmp(done);
 
   L(somehow_double_cleared);  // somehow, something else cleared our reserve??
   DebugBreak();
@@ -1808,6 +1843,25 @@ void X64Backend::PrepareForReentry(void* ctx) {
   X64BackendContext* bctx = BackendContextForGuestContext(ctx);
 
   bctx->current_stackpoint_depth = 0;
+}
+
+uint32_t X64Backend::EnterNestedGuestStack(void* ctx) {
+  X64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  const uint32_t depth = bctx->current_stackpoint_depth;
+  if (bctx->stackpoints && depth < uint32_t(cvars::max_stackpoints)) {
+    // A guest stack pointer is never above this, so the longjmp detection in
+    // ResolveFunction stops here instead of matching kernel frames.
+    X64BackendStackpoint& barrier = bctx->stackpoints[depth];
+    barrier.host_stack_ = 0;
+    barrier.guest_stack_ = 0xFFFFFFFFu;
+    barrier.guest_return_address_ = 0;
+    bctx->current_stackpoint_depth = depth + 1;
+  }
+  return depth;
+}
+
+void X64Backend::LeaveNestedGuestStack(void* ctx, uint32_t saved_state) {
+  BackendContextForGuestContext(ctx)->current_stackpoint_depth = saved_state;
 }
 
 constexpr uint32_t mxcsr_table[8] = {

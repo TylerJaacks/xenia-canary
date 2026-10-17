@@ -34,6 +34,13 @@ dword_result_t XamAvatarInitialize_entry(
   if (kernel_state()->title_id() == kAvatarEditorID) {
     return X_STATUS_SUCCESS;
   }
+  // The XNA runtime (Xbox Live Indie Games) initializes avatars for the
+  // game's GamerServices and throws "An unexpected error has occurred" from
+  // AvatarDescription/AvatarRenderer when this fails. Its avatar asset
+  // requests are left pending below, which it handles.
+  if (kernel_state()->title_id() == kXN_2002) {
+    return X_STATUS_SUCCESS;
+  }
 
   return cvars::allow_avatar_initialization ? X_STATUS_SUCCESS : ~0u;
 }
@@ -140,6 +147,23 @@ dword_result_t XamAvatarGetAssets_entry(
     dword_t avatar_component_mask, dword_t flags, lpdword_t result_buffer_ptr,
     lpdword_t gpu_resource_buffer_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  // Avatar assets are not emulated. The XNA runtime's AvatarRenderer turns a
+  // failed request into an exception in AvatarRenderer.State, but treats one
+  // that is still pending as "Loading": leave it pending, so indie games just
+  // draw no avatar.
+  if (overlapped_ptr && kernel_state()->title_id() == kXN_2002) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      XELOGW(
+          "XamAvatarGetAssets: avatar assets are not emulated; leaving the "
+          "request pending (avatars stay in their loading state)");
+    }
+    overlapped_ptr->result = X_ERROR_IO_PENDING;
+    overlapped_ptr->extended_error = X_ERROR_IO_PENDING;
+    overlapped_ptr->length = 0;
+    return X_ERROR_IO_PENDING;
+  }
   // 58410907 doesn't crash if we return failure.
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediateEx(

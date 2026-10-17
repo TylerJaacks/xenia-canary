@@ -115,8 +115,25 @@ class CodeCacheBase : public CodeCache {
     indirection_default_value_ = default_value;
   }
 
+  // True if |guest_address| has a slot in the indirection table. Guest code
+  // outside the window (e.g. JIT output in the 0x4xxxxxxx heap) must be
+  // reached through the resolver instead.
+  static constexpr bool IsInIndirectionWindow(uint32_t guest_address) {
+    return guest_address - uint32_t(kIndirectionTableBase) <
+           uint32_t(kIndirectionTableSize);
+  }
+
+  void ResetIndirection(uint32_t guest_address) {
+    if (!indirection_table_base_ || !IsInIndirectionWindow(guest_address)) {
+      return;
+    }
+    uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
+        indirection_table_base_ + (guest_address - kIndirectionTableBase));
+    *indirection_slot = indirection_default_value_;
+  }
+
   void AddIndirection(uint32_t guest_address, uint32_t host_address) {
-    if (!indirection_table_base_) {
+    if (!indirection_table_base_ || !IsInIndirectionWindow(guest_address)) {
       return;
     }
     uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
@@ -210,8 +227,10 @@ class CodeCacheBase : public CodeCache {
     self().OnCodePlaced(guest_address, function_info, code_execute_address,
                         func_info.code_size.total);
 
-    // Fix up indirection table.
-    if (guest_address && indirection_table_base_) {
+    // Fix up indirection table. Guest-generated code may live outside the
+    // window; computing a slot for it would scribble over host memory.
+    if (guest_address && indirection_table_base_ &&
+        IsInIndirectionWindow(guest_address)) {
       uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
           indirection_table_base_ + (guest_address - kIndirectionTableBase));
       *indirection_slot =

@@ -12,6 +12,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ namespace cpu {
 constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
 
 class Breakpoint;
+class GuestCodeModule;
 class StackWalker;
 class XexModule;
 
@@ -114,6 +116,22 @@ class Processor {
   std::vector<Function*> FindFunctionsWithAddress(uint32_t address);
   void RemoveFunctionByAddress(uint32_t address);
 
+  // Guest-generated code (--guest_code_generation), e.g. the PowerPC JIT in
+  // the .NET Compact Framework that hosts XNA titles.
+  GuestCodeModule* guest_code_module() const {
+    return guest_code_module_.get();
+  }
+  // Drops translations of guest-generated code overlapping
+  // [address, address + length) so they are re-translated on their next call.
+  // Called for icbi, KeSweepIcacheRange/KeFlushCacheRange and frees.
+  void InvalidateGuestCode(uint32_t address, uint32_t length);
+  // Called by the kernel when the guest maps memory as executable.
+  void OnGuestExecutableMemory(uint32_t address, uint32_t length);
+  // Commits (once) the indirection-table pages covering [low, high) inside
+  // the backend's indirection window. Backends call this before emitting a
+  // table load for a guest-generated call target.
+  void EnsureGuestCodeIndirection(uint32_t low, uint32_t high);
+
   Function* LookupFunction(uint32_t address);
   Module* LookupModule(uint32_t address);
   Function* LookupFunction(Module* module, uint32_t address);
@@ -123,6 +141,20 @@ class Processor {
   bool ExecuteRaw(ThreadState* thread_state, uint32_t address);
   uint64_t Execute(ThreadState* thread_state, uint32_t address, uint64_t args[],
                    size_t arg_count);
+
+  // System calls (sc, LEV=0). Titles never make them; the kernel installs a
+  // handler for code it runs in user mode (KeEnterUserMode). `address` is the
+  // address of the sc instruction. Returns false if nothing handled it.
+  using SyscallHandler = bool (*)(void* userdata, ppc::PPCContext* context,
+                                  uint32_t address);
+  void SetSyscallHandler(SyscallHandler handler, void* userdata) {
+    syscall_handler_ = handler;
+    syscall_handler_userdata_ = userdata;
+  }
+  bool HandleSyscall(ppc::PPCContext* context, uint32_t address) {
+    return syscall_handler_ &&
+           syscall_handler_(syscall_handler_userdata_, context, address);
+  }
 
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
@@ -270,7 +302,15 @@ class Processor {
   ExecutionState execution_state_ = ExecutionState::kPaused;
   std::vector<std::unique_ptr<Module>> modules_;
   Module* builtin_module_ = nullptr;
+  // Not in modules_: it must only be consulted after every real module.
+  std::unique_ptr<GuestCodeModule> guest_code_module_;
+  // 4 KiB guest pages inside the backend's indirection window whose
+  // indirection slots were committed for guest-generated code.
+  std::set<uint32_t> guest_code_indirection_pages_;
   uint32_t next_builtin_address_ = 0xFFFF0000u;
+
+  SyscallHandler syscall_handler_ = nullptr;
+  void* syscall_handler_userdata_ = nullptr;
 
   // Maps thread ID to state. Updated on thread create, and threads are never
   // removed. Must be guarded with the global lock.

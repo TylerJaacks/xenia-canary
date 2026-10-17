@@ -21,6 +21,7 @@
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/guest_code_module.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/ppc/ppc_context.h"
@@ -330,12 +331,34 @@ void A64Emitter::UnimplementedInstr(const hir::Instr* i) {
   DebugBreak();
 }
 
+// Guest addresses that have a slot in the code cache's indirection table
+// (CodeCacheBase::kIndirectionTableBase/Size).
+static constexpr bool IsInIndirectionWindow(uint32_t guest_address) {
+  return guest_address - 0x80000000u < 0x20000000u;
+}
+
 void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   ForgetFpcrMode();
   auto fn = static_cast<A64Function*>(function);
 
-  if (fn->machine_code()) {
+  // Code the guest generated at runtime can be invalidated and re-translated,
+  // so never bake its current host address into the caller.
+  const bool is_guest_generated =
+      processor()->guest_code_module() &&
+      function->module() == processor()->guest_code_module();
+
+  if (is_guest_generated && code_cache_->has_indirection_table()) {
+    mov(w16, function->address());  // Guest target, also read by the thunk.
+    if (IsInIndirectionWindow(function->address())) {
+      processor()->EnsureGuestCodeIndirection(function->address(),
+                                              function->address() + 4);
+      ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
+    } else {
+      // No indirection slot exists; resolve on every call.
+      mov(x9, reinterpret_cast<uint64_t>(backend()->resolve_function_thunk()));
+    }
+  } else if (fn->machine_code()) {
     // Direct call — function is already compiled.
     mov(x9, reinterpret_cast<uint64_t>(fn->machine_code()));
     if (!(instr->flags & hir::CALL_TAIL)) {
@@ -357,9 +380,7 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
       br(x9);
     }
     return;
-  }
-
-  if (code_cache_->has_indirection_table()) {
+  } else if (code_cache_->has_indirection_table()) {
     // Load host code address from indirection table.
     mov(w16, function->address());
     ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
@@ -405,8 +426,27 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   // Load host code address from indirection table.
   if (code_cache_->has_indirection_table()) {
     mov(w16, target_w);  // w16 = guest address (also used by resolve thunk)
-    ldr(w9, ptr(x16, static_cast<uint32_t>(
-                         0)));  // w9 = host code from indirection table
+    if (cvars::guest_code_generation) {
+      // Targets outside the indirection window (e.g. code a JIT emitted into
+      // the 0x40000000 heap) have no table slot; send them to the resolver
+      // thunk instead of loading from unmapped host memory.
+      auto& done = NewCachedLabel();
+      auto& outside_window = AddToTail([&done](A64Emitter& e, Label& lbl) {
+        e.mov(e.x9, reinterpret_cast<uint64_t>(
+                        e.backend()->resolve_function_thunk()));
+        e.b(done);
+      });
+      mov(w17, 0x80000000u);
+      sub(w17, w16, w17);
+      mov(w9, 0x20000000u);
+      cmp(w17, w9);
+      b(HS, outside_window);
+      ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
+      L(done);
+    } else {
+      ldr(w9, ptr(x16, static_cast<uint32_t>(
+                           0)));  // w9 = host code from indirection table
+    }
   } else {
     // Fallback: resolve at runtime.
     mov(w16, target_w);

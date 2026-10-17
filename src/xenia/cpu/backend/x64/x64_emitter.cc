@@ -32,6 +32,7 @@
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/function_debug_info.h"
+#include "xenia/cpu/guest_code_module.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/hir/opcodes.h"
 #include "xenia/cpu/hir/value.h"
@@ -651,6 +652,18 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
 
                  */
 
+                // A barrier pushed by Backend::EnterNestedGuestStack: the
+                // guest returned into frames older than the nested stack (e.g.
+                // kernel user-mode code resuming after a system call returns
+                // to callers entered before it). Their host frames are gone,
+                // so there is nothing to restore; continue as a tail call.
+                if (current_stackpoint_index != 0xFFFFFFFF &&
+                    stackpoints[current_stackpoint_index].host_stack_ == 0 &&
+                    stackpoints[current_stackpoint_index].guest_stack_ ==
+                        0xFFFFFFFFu) {
+                  num_frames_bigger = 0;
+                }
+
                 if (num_frames_bigger > 1) {
                   /*
                    * can't do anything about this right now :(
@@ -681,13 +694,39 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   return addr;
 }
 
+// Guest addresses that have a slot in the code cache's indirection table
+// (CodeCacheBase::kIndirectionTableBase/Size).
+static constexpr bool IsInIndirectionWindow(uint32_t guest_address) {
+  return guest_address - 0x80000000u < 0x20000000u;
+}
+
 void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   assert_not_null(function);
   ForgetMxcsrMode();
   auto fn = static_cast<X64Function*>(function);
   // Resolve address to the function to call and store in rax.
 
-  if (fn->machine_code()) {
+  // Code the guest generated at runtime can be invalidated and re-translated,
+  // so never bake its current host address into the caller.
+  const bool is_guest_generated =
+      processor()->guest_code_module() &&
+      function->module() == processor()->guest_code_module();
+
+  if (is_guest_generated && code_cache_->has_indirection_table() &&
+      !IsInIndirectionWindow(function->address())) {
+    // No indirection slot exists for this address; go through the resolver
+    // thunk on every call (ebx = guest target).
+    mov(ebx, function->address());
+    mov(eax, static_cast<uint32_t>(reinterpret_cast<uint64_t>(
+                 backend()->resolve_function_thunk())));
+  } else if (is_guest_generated && code_cache_->has_indirection_table()) {
+    // Reached through its indirection slot so a re-translation is picked up;
+    // make sure the slot's page exists before emitting the load.
+    processor()->EnsureGuestCodeIndirection(function->address(),
+                                            function->address() + 4);
+    mov(ebx, function->address());
+    mov(eax, dword[ebx]);
+  } else if (fn->machine_code()) {
     if (!(instr->flags & hir::CALL_TAIL)) {
       mov(rcx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
 
@@ -755,7 +794,28 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
     if (reg.cvt32() != ebx) {
       mov(ebx, reg.cvt32());
     }
-    mov(eax, dword[ebx]);
+    if (cvars::guest_code_generation) {
+      // Targets outside the indirection window (e.g. code a JIT emitted into
+      // the 0x40000000 heap) have no table slot - reading one would touch
+      // unmapped host memory. Send them to the resolver thunk instead, which
+      // takes the guest target in ebx.
+      Xbyak::Label& done = NewCachedLabel();
+      Xbyak::Label& outside_window =
+          AddToTail([&done](X64Emitter& e, Xbyak::Label& me) {
+            e.L(me);
+            e.mov(e.eax, static_cast<uint32_t>(reinterpret_cast<uint64_t>(
+                             e.backend()->resolve_function_thunk())));
+            e.jmp(done, T_NEAR);
+          });
+      mov(eax, ebx);
+      sub(eax, 0x80000000u);
+      cmp(eax, 0x20000000u);
+      jae(outside_window, T_NEAR);
+      mov(eax, dword[ebx]);
+      L(done);
+    } else {
+      mov(eax, dword[ebx]);
+    }
   } else {
     // Old-style resolve.
     // Not too important because indirection table is almost always available.

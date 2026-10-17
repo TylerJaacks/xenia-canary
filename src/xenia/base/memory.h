@@ -156,6 +156,21 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length,
                   PageAccess access, size_t file_offset);
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);
 
+// Address ranges that file views are placed into and removed from piece by
+// piece (e.g. a guest address space whose pages are bound on demand).
+// Reserves an inaccessible range at base_address (nullptr for any address).
+void* ReserveViewRange(void* base_address, size_t length);
+// Maps [file_offset, file_offset + length) at address, which must lie inside a
+// reserved view range, be aligned to allocation_granularity() and not hold a
+// view already.
+bool MapViewInRange(FileMappingHandle handle, void* address, size_t length,
+                    PageAccess access, size_t file_offset);
+// Turns [address, address + length), previously mapped with MapViewInRange
+// with exactly these bounds, back into inaccessible reserved space.
+bool UnmapViewInRange(FileMappingHandle handle, void* address, size_t length);
+// Releases a view range whose views have all been unmapped.
+void ReleaseViewRange(void* base_address, size_t length);
+
 inline size_t hash_combine(size_t seed) { return seed; }
 
 template <typename T, typename... Ts>

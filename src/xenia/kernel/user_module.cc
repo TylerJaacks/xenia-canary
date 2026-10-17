@@ -145,7 +145,13 @@ X_STATUS UserModule::LoadFromMemory(const void* addr, const size_t length) {
 
     magic = make_fourcc(M, Z, 0, 0);
     if (magic == kEXESignature) {
-      XELOGE("XNA executables are not yet implemented");
+      // Managed (.NET CF) assembly, e.g. the entry point of an Xbox Live
+      // Indie Game. These are executed by the XNA host title, not by the XEX
+      // loader; see Emulator::LaunchXnaGame / --xna_host_path.
+      XELOGE(
+          "{} is a .NET/XNA assembly, not an Xbox 360 executable. It must be "
+          "run through the XNA host (see --xna_host_path).",
+          name_);
       return X_STATUS_NOT_IMPLEMENTED;
     } else {
       // restore it back

@@ -319,20 +319,37 @@ int XexModule::ApplyPatch(XexModule* module) {
   // Update security info context with latest security info data
   module->ReadSecurityInfo();
 
-  uint32_t new_image_size = module->image_size();
+  // The patch may move the image to another heap, e.g. the XNA Indie Player
+  // launcher goes from a 4 KiB-page image at 0x92000000 (3.2.1.0) to a
+  // 64 KiB-page image at 0x82000000 (4.0.21021.0). The page size, and so the
+  // new image size, depends on the heap the new base lives in, so look the
+  // base up first instead of sizing the patched page descriptors with the old
+  // heap's page size.
+  uint32_t new_base_address = module->base_address();
+  xe::be<uint32_t>* base_addr_opt = nullptr;
+  if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
+    new_base_address = *base_addr_opt;
+  }
+  uint32_t new_image_size = 0;
+  if (auto new_heap = memory()->LookupHeap(new_base_address)) {
+    for (uint32_t i = 0; i < module->xex_security_info()->page_descriptor_count;
+         i++) {
+      xex2_page_descriptor desc;
+      desc.value =
+          xe::byte_swap(module->xex_security_info()->page_descriptors[i].value);
+      new_image_size += desc.page_count * new_heap->page_size();
+    }
+  } else {
+    new_image_size = module->image_size();
+  }
 
   // Check if we need to alloc new memory for the patched xex
-  if (new_image_size > original_image_size) {
-    uint32_t size_delta = new_image_size - original_image_size;
+  if (new_image_size > original_image_size ||
+      original_base_address != new_base_address) {
+    uint32_t size_delta = new_image_size > original_image_size
+                              ? new_image_size - original_image_size
+                              : 0;
     uint32_t addr_new_mem = module->base_address_ + original_image_size;
-
-    // Before we allocate new range we must check if patch haven't modified
-    // base_address.
-    uint32_t new_base_address = module->base_address();
-    xe::be<uint32_t>* base_addr_opt = nullptr;
-    if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
-      new_base_address = *base_addr_opt;
-    }
 
     if (original_base_address != new_base_address) {
       XELOGW(

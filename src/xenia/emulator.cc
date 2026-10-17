@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <cstring>
 #include <ranges>
 
 #include "xenia/emulator.h"
@@ -43,6 +45,7 @@
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
+#include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
 #include "xenia/kernel/xbdm/xbdm_module.h"
@@ -77,6 +80,16 @@ DEFINE_string(
     "Executable to launch from the .iso or the package instead of default.xex "
     "or the module specified by the game. Leave blank to launch the default "
     "module.",
+    "General");
+
+DEFINE_path(
+    xna_host_path, "",
+    "Host path to Xna_TitleLauncher.xex, the XNA Indie Player launcher (title "
+    "584E07D2, version 3.2.1.0, from the system update / $SystemUpdate). Its "
+    "title update tu32000100_00000000 must be installed (content/"
+    "0000000000000000/584E07D2/000B0000); it carries HostLoader.dll and the "
+    "XNA/.NET CF runtimes. Indie game packages contain no native code and "
+    "cannot run without it. Experimental.",
     "General");
 
 DEFINE_bool(allow_game_relative_writes, false,
@@ -667,7 +680,141 @@ X_STATUS Emulator::LaunchDiscArchive(const std::filesystem::path& path) {
   return result;
 }
 
+std::optional<kernel::util::XnaGameInfo> Emulator::ReadMountedXnaGameInfo() {
+  const std::string game_info_path =
+      fmt::format("{}\\GameInfo.bin", kDefaultGameSymbolicLink);
+  vfs::Entry* entry = file_system_->ResolvePath(game_info_path);
+  if (!entry || entry->size() == 0 || entry->size() > 64 * 1024) {
+    return std::nullopt;
+  }
+
+  vfs::File* file = nullptr;
+  if (XFAILED(entry->Open(vfs::FileAccess::kGenericRead, &file)) || !file) {
+    return std::nullopt;
+  }
+  std::vector<uint8_t> buffer(entry->size());
+  size_t bytes_read = 0;
+  const X_STATUS read_result = file->ReadSync(
+      std::span<uint8_t>(buffer.data(), buffer.size()), 0, &bytes_read);
+  file->Destroy();
+  if (XFAILED(read_result)) {
+    return std::nullopt;
+  }
+  buffer.resize(bytes_read);
+  return kernel::util::ParseXnaGameInfo(buffer);
+}
+
+X_STATUS Emulator::LaunchXnaGame(const std::filesystem::path& path,
+                                 const kernel::util::XnaGameInfo& info) {
+  XELOGI("Xbox Live Indie Game detected: \"{}\"", info.title);
+  XELOGI("  Entry assembly:   {}", info.entry_assembly);
+  XELOGI("  Runtime profile:  {} (XNA Framework {}, {} profile)",
+         info.runtime_profile, info.framework_version(),
+         info.graphics_profile());
+  XELOGI("  Game title ID:    {:08X}", info.community_title_id);
+  XELOGI("  Virtual title ID: {}", info.virtual_title_id);
+
+  if (cvars::xna_host_path.empty()) {
+    XELOGE(
+        "This package is an Xbox Live Indie Game. It contains only .NET "
+        "Compact Framework assemblies (no default.xex), which the console runs "
+        "through its XNA host executable (title 584E07D2 plus its title "
+        "update). Set xna_host_path to a copy of that executable dumped from "
+        "your console.");
+    return X_STATUS_NOT_SUPPORTED;
+  }
+
+  // Resolve relative paths against the working directory: the host is
+  // mounted by its parent folder, and a bare file name has an empty parent.
+  std::filesystem::path host_path = cvars::xna_host_path;
+  std::error_code absolute_error;
+  if (auto absolute_path = std::filesystem::absolute(host_path, absolute_error);
+      !absolute_error) {
+    host_path = absolute_path.lexically_normal();
+  }
+  if (!std::filesystem::is_regular_file(host_path)) {
+    XELOGE("xna_host_path does not exist: {}", xe::path_to_utf8(host_path));
+    return X_STATUS_NO_SUCH_FILE;
+  }
+
+  XELOGW(
+      "XBLIG support is experimental: the XNA runtime runs in emulated kernel "
+      "user mode, and faults raised by user-mode code (e.g. managed null "
+      "references) are not delivered to it yet.");
+
+  // The .NET Compact Framework JIT-compiles managed code into guest memory.
+  // Nothing has been translated yet, so turning this on here is in time.
+  if (!cvars::guest_code_generation) {
+    XELOGI("Enabling guest_code_generation for the XNA runtime's JIT");
+    cvars::guest_code_generation = true;
+  }
+
+  // 1. Make the package visible the way it is on a console: marketplace
+  //    content owned by 584E07D2, opened by the host via XamContentCreate.
+  ContentInstallEntry install_entry(path);
+  X_STATUS result = ProcessContentPackageHeader(path, install_entry);
+  if (XFAILED(result)) {
+    return result;
+  }
+  if (!std::filesystem::exists(install_entry.data_installation_path_ /
+                               install_entry.filename_)) {
+    result = InstallContentPackage(path, install_entry);
+    if (XFAILED(result)) {
+      XELOGE("Failed to install indie game package: {}",
+             install_entry.installation_error_message_);
+      return result;
+    }
+  }
+
+  // 2. Tell the launcher which package to run. Xna_TitleLauncher reads XAM
+  //    launch data and accepts several layouts (0x8, 0xC, 0x34, 0x178,
+  //    0x238 bytes); it writes the 0x34-byte one itself when it relaunches
+  //    a game: be32 0xCAFEBABE, char file_name[43] (the package's STFS
+  //    content file name), be32 content device ID at +0x30. The launcher
+  //    opens the package with XamContentCreate using an XCONTENT_DATA built
+  //    from these (device_id, type 2 = marketplace, file_name); a device ID
+  //    of 0 leaves its storage layer uninitialized and every content access
+  //    fails with E_UNEXPECTED (reported as launcher error 0xC).
+  struct XnaLaunchData {
+    xe::be<uint32_t> magic;
+    char file_name[43];
+    uint8_t pad;
+    xe::be<uint32_t> device_id;
+  };
+  static_assert_size(XnaLaunchData, 0x34);
+  XnaLaunchData xna_launch_data{};
+  xna_launch_data.magic = 0xCAFEBABE;
+  xna_launch_data.device_id =
+      static_cast<uint32_t>(kernel::xam::DummyDeviceId::HDD);
+  const std::string package_name = xe::path_to_utf8(path.filename());
+  std::memcpy(xna_launch_data.file_name, package_name.data(),
+              std::min(package_name.size(), size_t(42)));
+  auto xam = kernel_state_->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  auto& launch_data = xam->loader_data().launch_data;
+  launch_data.resize(sizeof(xna_launch_data));
+  std::memcpy(launch_data.data(), &xna_launch_data, sizeof(xna_launch_data));
+
+  // 3. Boot the host like any HDD title: its own folder becomes game:.
+  result = MountPath(host_path, "\\Device\\Harddisk0\\Partition1");
+  if (XFAILED(result)) {
+    return result;
+  }
+  result = CompleteLaunch(host_path,
+                          fmt::format("{}\\{}", kDefaultGameSymbolicLink,
+                                      xe::path_to_utf8(host_path.filename())));
+  if (XSUCCEEDED(result)) {
+    kernel_state_->deployment_type_ = XDeploymentType::kInstalledToHDD;
+  }
+  return result;
+}
+
 X_STATUS Emulator::LaunchStfsContainer(const std::filesystem::path& path) {
+  if (cvars::launch_module.empty()) {
+    if (auto xna_game = ReadMountedXnaGameInfo()) {
+      return LaunchXnaGame(path, *xna_game);
+    }
+  }
+
   std::string module_path = FindLaunchModule();
   X_STATUS result = CompleteLaunch(path, module_path);
 
@@ -1398,11 +1545,24 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 
   // Within range. Dump information into the log before pausing, Pause() can
   // block (e.g. waiting on the GPU/audio systems) and the dump would be lost.
+  // Get the essentials in first: what follows can fail too.
   auto current_thread = kernel::XThread::GetCurrentThread();
-  assert_not_null(current_thread);
-
   auto guest_function = code_cache->LookupFunction(ex->pc());
-  assert_not_null(guest_function);
+  XELOGE(
+      "Guest crash: {} at host pc {:016X} (guest pc {:08X}), fault address "
+      "{:016X}, guest thread {:08X}",
+      ex->code() == Exception::Code::kAccessViolation ? "access violation"
+                                                      : "illegal instruction",
+      ex->pc(),
+      guest_function ? guest_function->MapMachineCodeToGuestAddress(ex->pc())
+                     : 0,
+      ex->code() == Exception::Code::kAccessViolation ? ex->fault_address() : 0,
+      current_thread ? current_thread->thread_id() : 0);
+  FlushLog();
+  if (!current_thread || !guest_function) {
+    // No guest thread or function to report on (e.g. a helper thunk).
+    return false;
+  }
 
   auto context = current_thread->thread_state()->context();
 

@@ -83,6 +83,10 @@ enum : uint32_t {
       2,  // non-java mode bit is currently set. for use in software fp routines
   kX64BackendNonIEEEMode =
       3,  // non-ieee mode is currently enabled for scalar fpu.
+  // The current reservation (kX64BackendHasReserveBit) holds its block's bit
+  // in ReserveHelper. Without it the reservation is shared: another thread
+  // held the block, and only the value check in the reserved store applies.
+  kX64BackendOwnsReserveBit = 4,
 };
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
@@ -153,6 +157,7 @@ class X64Backend : public Backend {
   bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
+  void ResetIndirection(uint32_t guest_address) override;
 
   std::unique_ptr<Assembler> CreateAssembler() override;
 
@@ -168,6 +173,8 @@ class X64Backend : public Backend {
   virtual void InitializeBackendContext(void* ctx) override;
   virtual void DeinitializeBackendContext(void* ctx) override;
   virtual void PrepareForReentry(void* ctx) override;
+  uint32_t EnterNestedGuestStack(void* ctx) override;
+  void LeaveNestedGuestStack(void* ctx, uint32_t saved_state) override;
   X64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));

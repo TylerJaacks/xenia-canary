@@ -113,6 +113,7 @@ class A64Backend : public Backend {
   bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
+  void ResetIndirection(uint32_t guest_address) override;
 
   std::unique_ptr<Assembler> CreateAssembler() override;
 
@@ -128,6 +129,8 @@ class A64Backend : public Backend {
   void InitializeBackendContext(void* ctx) override;
   void DeinitializeBackendContext(void* ctx) override;
   void PrepareForReentry(void* ctx) override;
+  uint32_t EnterNestedGuestStack(void* ctx) override;
+  void LeaveNestedGuestStack(void* ctx, uint32_t saved_state) override;
 
   A64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<A64BackendContext*>(

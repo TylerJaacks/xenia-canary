@@ -9,6 +9,8 @@
 
 #include "xenia/cpu/processor.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
 #include "xenia/base/byte_order.h"
@@ -25,6 +27,7 @@
 #include "xenia/cpu/breakpoint.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
+#include "xenia/cpu/guest_code_module.h"
 #include "xenia/cpu/module.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -93,6 +96,7 @@ Processor::~Processor() {
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
+    guest_code_module_.reset();
   }
 
   frontend_.reset();
@@ -134,6 +138,10 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
 
   backend_ = std::move(backend);
   frontend_ = std::move(frontend);
+
+  // Always created; it only claims addresses while --guest_code_generation is
+  // enabled, so the cvar can be turned on right before a title is launched.
+  guest_code_module_ = std::make_unique<GuestCodeModule>(this);
 
   // Stack walker is used when profiling, debugging, and dumping.
   // Note that creation may fail, in which case we'll have to disable those
@@ -267,9 +275,20 @@ Function* Processor::ResolveFunction(uint32_t address) {
       return nullptr;
     }
 
+    const bool is_guest_generated =
+        guest_code_module_ && function->module() == guest_code_module_.get();
+    if (is_guest_generated) {
+      // Placing the translation writes the indirection slot for |address|, so
+      // the backing page must exist if |address| is inside the window.
+      EnsureGuestCodeIndirection(address, address + 4);
+    }
+
     if (!DemandFunction(function)) {
       entry_table_.MarkFailed(entry);
       return nullptr;
+    }
+    if (is_guest_generated) {
+      guest_code_module_->NoteFunctionSpan(address, function->end_address());
     }
     // only add it to the list of resolved functions if resolving succeeded
     auto module_for = function->module();
@@ -302,7 +321,64 @@ Module* Processor::LookupModule(uint32_t address) {
       return module.get();
     }
   }
+  // Last resort: code the guest produced at runtime (JIT). Only claims
+  // addresses while --guest_code_generation is enabled.
+  if (guest_code_module_ && guest_code_module_->ContainsAddress(address)) {
+    return guest_code_module_.get();
+  }
   return nullptr;
+}
+
+void Processor::EnsureGuestCodeIndirection(uint32_t low, uint32_t high) {
+  if (!backend_ || high <= low) {
+    return;
+  }
+  // Mirrors the x64/a64 code cache indirection window
+  // (CodeCacheBase::kIndirectionTableBase, 512 MiB).
+  constexpr uint32_t kWindowLow = 0x80000000u;
+  constexpr uint32_t kWindowHigh = 0xA0000000u;
+  low = std::max(low, kWindowLow);
+  high = std::min(high, kWindowHigh);
+  if (high <= low) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t page = low & ~0xFFFu; page < high; page += 0x1000) {
+    if (guest_code_indirection_pages_.insert(page).second) {
+      backend_->CommitExecutableRange(page, page + 0x1000);
+    }
+    if (page >= kWindowHigh - 0x1000) {
+      break;  // Avoid wrapping.
+    }
+  }
+}
+
+void Processor::OnGuestExecutableMemory(uint32_t address, uint32_t length) {
+  if (!cvars::guest_code_generation || !length) {
+    return;
+  }
+  const uint32_t high =
+      address + length < address ? 0xFFFFFFFFu : address + length;
+  // Anything previously translated here is stale now.
+  InvalidateGuestCode(address, high - address);
+  EnsureGuestCodeIndirection(address, high);
+}
+
+void Processor::InvalidateGuestCode(uint32_t address, uint32_t length) {
+  if (!guest_code_module_ || !length) {
+    return;
+  }
+  const uint32_t high =
+      address + length < address ? 0xFFFFFFFFu : address + length;
+  auto global_lock = global_critical_region_.Acquire();
+  const std::vector<uint32_t> removed =
+      guest_code_module_->Invalidate(address, high);
+  for (const uint32_t function_address : removed) {
+    // The next ResolveFunction creates a fresh entry, DeclareFunction hands
+    // out a fresh Function, and the frontend re-reads the guest bytes.
+    entry_table_.Delete(function_address);
+    backend_->ResetIndirection(function_address);
+  }
 }
 Function* Processor::LookupFunction(uint32_t address) {
   // TODO(benvanik): fast reject invalid addresses/log errors.

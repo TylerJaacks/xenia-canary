@@ -421,5 +421,42 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address,
   return munmap(base_address, length) == 0;
 }
 
+void* ReserveViewRange(void* base_address, size_t length) {
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  if (base_address) {
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#endif
+  }
+  void* result = mmap(base_address, length, PROT_NONE, flags, -1, 0);
+  if (result == MAP_FAILED) {
+    return nullptr;
+  }
+  if (base_address && result != base_address) {
+    munmap(result, length);
+    return nullptr;
+  }
+  return result;
+}
+
+bool MapViewInRange(FileMappingHandle handle, void* address, size_t length,
+                    PageAccess access, size_t file_offset) {
+  // MAP_FIXED atomically replaces whatever is in the range.
+  void* result = mmap(address, length, ToPosixProtectFlags(access),
+                      MAP_SHARED | MAP_FIXED, handle, off_t(file_offset));
+  return result == address;
+}
+
+bool UnmapViewInRange(FileMappingHandle handle, void* address, size_t length) {
+  void* result =
+      mmap(address, length, PROT_NONE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  return result == address;
+}
+
+void ReleaseViewRange(void* base_address, size_t length) {
+  munmap(base_address, length);
+}
+
 }  // namespace memory
 }  // namespace xe

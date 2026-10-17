@@ -282,5 +282,105 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address,
   return UnmapViewOfFile(base_address) ? true : false;
 }
 
+// Placeholder APIs (Windows 10 1803+), looked up at runtime so older SDKs and
+// systems still build and run without view ranges.
+namespace {
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER 0x00040000
+#endif
+#ifndef MEM_REPLACE_PLACEHOLDER
+#define MEM_REPLACE_PLACEHOLDER 0x00004000
+#endif
+#ifndef MEM_PRESERVE_PLACEHOLDER
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE process, PVOID base_address,
+                                       SIZE_T size, ULONG allocation_type,
+                                       ULONG page_protection,
+                                       void* extended_parameters,
+                                       ULONG parameter_count);
+using MapViewOfFile3Fn = PVOID(WINAPI*)(HANDLE file_mapping, HANDLE process,
+                                        PVOID base_address, ULONG64 offset,
+                                        SIZE_T view_size, ULONG allocation_type,
+                                        ULONG page_protection,
+                                        void* extended_parameters,
+                                        ULONG parameter_count);
+using UnmapViewOfFile2Fn = BOOL(WINAPI*)(HANDLE process, PVOID base_address,
+                                         ULONG unmap_flags);
+struct PlaceholderFunctions {
+  VirtualAlloc2Fn virtual_alloc2 = nullptr;
+  MapViewOfFile3Fn map_view_of_file3 = nullptr;
+  UnmapViewOfFile2Fn unmap_view_of_file2 = nullptr;
+  PlaceholderFunctions() {
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelbase) {
+      return;
+    }
+    virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
+        GetProcAddress(kernelbase, "VirtualAlloc2"));
+    map_view_of_file3 = reinterpret_cast<MapViewOfFile3Fn>(
+        GetProcAddress(kernelbase, "MapViewOfFile3"));
+    unmap_view_of_file2 = reinterpret_cast<UnmapViewOfFile2Fn>(
+        GetProcAddress(kernelbase, "UnmapViewOfFile2"));
+  }
+  bool available() const {
+    return virtual_alloc2 && map_view_of_file3 && unmap_view_of_file2;
+  }
+};
+const PlaceholderFunctions& GetPlaceholderFunctions() {
+  static const PlaceholderFunctions functions;
+  return functions;
+}
+}  // namespace
+
+void* ReserveViewRange(void* base_address, size_t length) {
+  const auto& fns = GetPlaceholderFunctions();
+  if (!fns.available()) {
+    return nullptr;
+  }
+  return fns.virtual_alloc2(GetCurrentProcess(), base_address, length,
+                            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                            PAGE_NOACCESS, nullptr, 0);
+}
+
+bool MapViewInRange(FileMappingHandle handle, void* address, size_t length,
+                    PageAccess access, size_t file_offset) {
+  const auto& fns = GetPlaceholderFunctions();
+  if (!fns.available()) {
+    return false;
+  }
+  // Split the placeholder so [address, address + length) is one of its own.
+  // This fails harmlessly when it already is (e.g. after UnmapViewInRange).
+  VirtualFree(address, length, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+  void* view = fns.map_view_of_file3(
+      handle, GetCurrentProcess(), address, ULONG64(file_offset), length,
+      MEM_REPLACE_PLACEHOLDER, ULONG(ToWin32ProtectFlags(access)), nullptr, 0);
+  if (view && view != address) {
+    UnmapViewOfFile(view);
+    return false;
+  }
+  return view != nullptr;
+}
+
+bool UnmapViewInRange(FileMappingHandle handle, void* address, size_t length) {
+  const auto& fns = GetPlaceholderFunctions();
+  if (!fns.available()) {
+    return false;
+  }
+  return fns.unmap_view_of_file2(GetCurrentProcess(), address,
+                                 MEM_PRESERVE_PLACEHOLDER)
+             ? true
+             : false;
+}
+
+void ReleaseViewRange(void* base_address, size_t length) {
+#ifndef MEM_COALESCE_PLACEHOLDERS
+#define MEM_COALESCE_PLACEHOLDERS 0x00000001
+#endif
+  // Merge the placeholders left by splitting, then release the whole range.
+  VirtualFree(base_address, length, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+  VirtualFree(base_address, 0, MEM_RELEASE);
+}
+
 }  // namespace memory
 }  // namespace xe

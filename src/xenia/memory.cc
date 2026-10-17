@@ -17,6 +17,7 @@
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/exception_handler.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/threading.h"
@@ -140,6 +141,11 @@ Memory::Memory() {
   active_memory_ = this;
 }
 
+// Alias space: [0, 4 GB) plus the host offset of the 0xE0000000 range.
+static uint64_t AliasSpaceLength(uint32_t granularity) {
+  return 0x100000000ull + granularity;
+}
+
 Memory::~Memory() {
   assert_true(active_memory_ == this);
   active_memory_ = nullptr;
@@ -147,6 +153,17 @@ Memory::~Memory() {
   // Uninstall the MMIO handler, as we won't be able to service more
   // requests.
   mmio_handler_.reset();
+
+  ExceptionHandler::Uninstall(AliasSpaceExceptionCallbackThunk, this);
+  if (uint8_t* alias_base = alias_membase_.exchange(nullptr)) {
+    for (const auto& view : alias_views_) {
+      xe::memory::UnmapViewInRange(mapping_, alias_base + view.first,
+                                   size_t(view.second));
+    }
+    alias_views_.clear();
+    xe::memory::ReleaseViewRange(
+        alias_base, size_t(AliasSpaceLength(system_allocation_granularity_)));
+  }
 
   for (auto invalidation_callback : physical_memory_invalidation_callbacks_) {
     delete invalidation_callback;
@@ -272,6 +289,9 @@ bool Memory::Initialize() {
     assert_always();
     return false;
   }
+  // Before the emulator's handler, which treats faults in guest code as
+  // crashes.
+  ExceptionHandler::Install(AliasSpaceExceptionCallbackThunk, this);
 
   // ?
   uint32_t unk_phys_alloc;
@@ -386,6 +406,248 @@ void Memory::UnmapViews() {
       xe::memory::UnmapFileView(mapping_, views_.all_views[n], length);
     }
   }
+}
+
+uint8_t* Memory::CreateAliasSpace(AliasSpaceResolver resolver, void* context) {
+  std::lock_guard<std::mutex> lock(alias_mutex_);
+  if (alias_membase_.load()) {
+    return alias_membase_.load();
+  }
+  const uint64_t length = AliasSpaceLength(system_allocation_granularity_);
+  // Like the main space, at a 4 GB-aligned host address: generated code may
+  // use the low 32 bits of the membase register as zero.
+  uint8_t* base = nullptr;
+  for (size_t n = 32; n < 47 && !base; n++) {
+    auto candidate = reinterpret_cast<uint8_t*>(1ull << n);
+    if (candidate + length > mapping_base_ &&
+        candidate < mapping_base_ + 0x120000000ull) {
+      continue;  // The main mapping.
+    }
+    base = static_cast<uint8_t*>(
+        xe::memory::ReserveViewRange(candidate, size_t(length)));
+  }
+  if (!base) {
+    XELOGE("Memory: unable to reserve a guest alias address space");
+    return nullptr;
+  }
+  alias_resolver_ = resolver;
+  alias_resolver_context_ = context;
+  alias_membase_.store(base);
+  XELOGI("Memory: guest alias address space at {}", static_cast<void*>(base));
+  return base;
+}
+
+uint64_t Memory::AliasSpaceHostOffset(uint32_t guest_address) const {
+  return uint64_t(guest_address) + (guest_address >= 0xE0000000
+                                        ? heaps_.vE0000000.host_address_offset()
+                                        : 0);
+}
+
+bool Memory::GetBackingOffset(const AliasSpacePage& page,
+                              uint32_t guest_address,
+                              uint64_t* out_offset) const {
+  const uint32_t source =
+      page.source_address + (guest_address - page.guest_address);
+  if (page.source_is_physical) {
+    if (source >= 0x20000000) {
+      return false;
+    }
+    // The "physical raw" view.
+    *out_offset = map_info[xe::countof(map_info) - 1].target_address + source;
+    return true;
+  }
+  const uint64_t granularity_mask =
+      ~uint64_t(system_allocation_granularity_ - 1);
+  const uint8_t* host = TranslateVirtual(source);
+  for (size_t n = 0; n + 1 < xe::countof(map_info); n++) {
+    if (source >= map_info[n].virtual_address_start &&
+        source <= map_info[n].virtual_address_end) {
+      *out_offset = (map_info[n].target_address & granularity_mask) +
+                    uint64_t(host - views_.all_views[n]);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Memory::BindAliasSpaceAddress(uint64_t host_offset) {
+  const uint64_t granularity = system_allocation_granularity_;
+  const uint32_t e0_offset = heaps_.vE0000000.host_address_offset();
+  auto to_guest = [e0_offset](uint64_t offset, uint32_t* out) {
+    if (offset >= 0xE0000000ull) {
+      if (offset < 0xE0000000ull + e0_offset ||
+          offset >= 0x100000000ull + e0_offset) {
+        return false;
+      }
+      offset -= e0_offset;
+    }
+    *out = uint32_t(offset);
+    return true;
+  };
+
+  std::lock_guard<std::mutex> lock(alias_mutex_);
+  auto overlaps = [this](uint64_t start, uint64_t length) {
+    auto it = alias_views_.upper_bound(start + length - 1);
+    if (it == alias_views_.begin()) {
+      return false;
+    }
+    --it;
+    return it->first + it->second > start;
+  };
+  if (overlaps(host_offset, 1)) {
+    // Another thread bound it first, or the fault is not about binding: an
+    // uncommitted page of the (SEC_RESERVE) backing on Windows faults in a
+    // bound view too, and retrying that would never end.
+#if XE_PLATFORM_WIN32
+    // (On Windows the length doubles as the query buffer size.)
+    size_t query_length = xe::memory::page_size();
+    xe::memory::PageAccess access;
+    if (xe::memory::QueryProtect(alias_membase_.load() + host_offset,
+                                 query_length, access) &&
+        access == xe::memory::PageAccess::kNoAccess) {
+      return false;
+    }
+#endif
+    return true;
+  }
+
+  uint32_t guest_address;
+  AliasSpacePage page;
+  if (!to_guest(host_offset, &guest_address) ||
+      !alias_resolver_(alias_resolver_context_, guest_address, &page)) {
+    return false;
+  }
+
+  uint64_t view_start, view_length, file_offset;
+  const uint64_t page_host = AliasSpaceHostOffset(page.guest_address);
+  if (!(page_host % granularity) && !(page.length % granularity)) {
+    view_start = page_host;
+    view_length = page.length;
+    if (!GetBackingOffset(page, page.guest_address, &file_offset)) {
+      return false;
+    }
+  } else {
+    // Pages smaller than a host allocation granule (4 KB pages on Windows):
+    // one view has to cover the whole granule. Bind it if every page in it
+    // that the resolver maps agrees on the granule's backing. Unmapped pages
+    // in it then show that backing too instead of faulting - they are usually
+    // other kernel allocations next to the user-visible ones.
+    view_start = host_offset & ~(granularity - 1);
+    view_length = granularity;
+    bool have_backing = false;
+    for (uint64_t offset = view_start; offset < view_start + granularity;) {
+      uint32_t sub_address;
+      AliasSpacePage sub_page;
+      uint64_t sub_offset;
+      if (!to_guest(offset, &sub_address) ||
+          !alias_resolver_(alias_resolver_context_, sub_address, &sub_page) ||
+          !GetBackingOffset(sub_page, sub_address, &sub_offset)) {
+        offset += xe::memory::page_size();
+        continue;
+      }
+      const uint64_t implied = sub_offset - (offset - view_start);
+      if (!have_backing) {
+        file_offset = implied;
+        have_backing = true;
+      } else if (implied != file_offset) {
+        XELOGE(
+            "Memory: alias page {:08X} shares a host granule with "
+            "differently backed pages ({:08X})",
+            guest_address, sub_address);
+        return false;
+      }
+      offset += sub_page.length - (sub_address - sub_page.guest_address);
+    }
+    if (!have_backing) {
+      return false;
+    }
+  }
+  if (file_offset % granularity || overlaps(view_start, view_length)) {
+    XELOGE(
+        "Memory: cannot bind alias page {:08X} (backing offset {:X} is not "
+        "granule-aligned, or the granule overlaps a bound view)",
+        guest_address, file_offset);
+    return false;
+  }
+  if (!xe::memory::MapViewInRange(
+          mapping_, alias_membase_.load() + view_start, size_t(view_length),
+          xe::memory::PageAccess::kReadWrite, size_t(file_offset))) {
+    XELOGE("Memory: mapping alias page {:08X} failed", guest_address);
+    return false;
+  }
+  alias_views_.emplace(view_start, view_length);
+  return true;
+}
+
+void Memory::InvalidateAliasSpace(uint32_t guest_address, uint32_t length) {
+  uint8_t* base = alias_membase_.load();
+  if (!base || !length) {
+    return;
+  }
+  const uint64_t start = AliasSpaceHostOffset(guest_address);
+  const uint64_t end = AliasSpaceHostOffset(guest_address + (length - 1)) + 1;
+  std::lock_guard<std::mutex> lock(alias_mutex_);
+  auto it = alias_views_.upper_bound(start);
+  if (it != alias_views_.begin()) {
+    --it;
+  }
+  while (it != alias_views_.end() && it->first < end) {
+    if (it->first + it->second <= start) {
+      ++it;
+      continue;
+    }
+    xe::memory::UnmapViewInRange(mapping_, base + it->first,
+                                 size_t(it->second));
+    it = alias_views_.erase(it);
+  }
+}
+
+void Memory::InvalidateAliasSpace() {
+  uint8_t* base = alias_membase_.load();
+  if (!base) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(alias_mutex_);
+  for (const auto& view : alias_views_) {
+    xe::memory::UnmapViewInRange(mapping_, base + view.first,
+                                 size_t(view.second));
+  }
+  alias_views_.clear();
+}
+
+bool Memory::AliasSpaceExceptionCallbackThunk(Exception* ex, void* data) {
+  auto memory = reinterpret_cast<Memory*>(data);
+  uint8_t* base = memory->alias_membase_.load();
+  if (!base || ex->code() != Exception::Code::kAccessViolation) {
+    return false;
+  }
+  const uint64_t fault = ex->fault_address();
+  const uint64_t length =
+      AliasSpaceLength(memory->system_allocation_granularity_);
+  if (fault < uint64_t(base) || fault >= uint64_t(base) + length) {
+    return false;
+  }
+  // Retry the access once the page is bound.
+  if (memory->BindAliasSpaceAddress(fault - uint64_t(base))) {
+    return true;
+  }
+  // Nothing maps it. On the console the kernel would deliver this fault to
+  // the code running in user mode; Xenia cannot yet, so this ends in a crash.
+  // Make sure the reason reaches the log first.
+  const uint64_t offset = fault - uint64_t(base);
+  const uint32_t e0_offset = memory->heaps_.vE0000000.host_address_offset();
+  const uint64_t guest =
+      offset >= 0xE0000000ull + e0_offset ? offset - e0_offset : offset;
+  const char* op = ex->access_violation_operation() ==
+                           Exception::AccessViolationOperation::kWrite
+                       ? "write"
+                       : "read";
+  XELOGE(
+      "Memory: user-mode {} of {:08X} is not mapped by the user-mode page "
+      "table (host pc {:016X}); user-mode faults are not delivered yet",
+      op, uint32_t(guest), ex->pc());
+  xe::FlushLog();
+  return false;
 }
 
 void Memory::Reset() {

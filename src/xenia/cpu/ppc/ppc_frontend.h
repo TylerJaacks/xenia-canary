@@ -34,6 +34,8 @@ struct PPCBuiltins {
   Function* enter_global_lock;
   Function* leave_global_lock;
   Function* syscall_handler;
+  // icbi with --guest_code_generation: EA in PPCContext::scratch.
+  Function* invalidate_icache_line;
 };
 
 class PPCFrontend {

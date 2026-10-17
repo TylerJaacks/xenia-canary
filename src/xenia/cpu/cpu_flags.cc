@@ -57,3 +57,12 @@ DEFINE_bool(break_condition_truncate, true, "truncate value to 32-bits", "CPU");
 
 DEFINE_bool(break_on_debugbreak, true, "int3 on JITed __debugbreak requests.",
             "CPU");
+
+DEFINE_bool(
+    guest_code_generation, false,
+    "Allow guest code to run from memory that is not part of a loaded module "
+    "and track instruction-cache invalidation (icbi, KeSweepIcacheRange). "
+    "Required by titles that JIT-compile PowerPC code at runtime, such as the "
+    "XNA Framework / .NET Compact Framework host used by Xbox Live Indie "
+    "Games. Makes indirect calls slightly slower.",
+    "CPU");

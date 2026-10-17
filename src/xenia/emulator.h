@@ -23,6 +23,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/game_info_database.h"
 #include "xenia/kernel/util/xlast.h"
+#include "xenia/kernel/util/xna_game_info.h"
 #include "xenia/memory.h"
 #include "xenia/patcher/patcher.h"
 #include "xenia/patcher/plugin_loader.h"
@@ -238,6 +239,13 @@ class Emulator {
 
   // Launches a game from an STFS container file.
   X_STATUS LaunchStfsContainer(const std::filesystem::path& path);
+
+  // Xbox Live Indie Games (XNA Creators Club packages). These hold only .NET
+  // CF assemblies, so they are run by handing them to the console's XNA host
+  // executable (title 584E07D2) instead of launching a default.xex.
+  std::optional<kernel::util::XnaGameInfo> ReadMountedXnaGameInfo();
+  X_STATUS LaunchXnaGame(const std::filesystem::path& path,
+                         const kernel::util::XnaGameInfo& info);
 
   X_STATUS LaunchDefaultModule(const std::filesystem::path& path);
 

@@ -80,15 +80,23 @@ void LeaveGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
   global_mutex->unlock();
 }
 
+// sc (LEV=0). Titles never issue system calls themselves; the kernel installs
+// a handler for code it runs in user mode. scratch holds the sc address.
 void SyscallHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
-  uint64_t syscall_number = ppc_context->r[0];
-  switch (syscall_number) {
-    default:
-      assert_unhandled_case(syscall_number);
-      XELOGE("Unhandled syscall {}!", syscall_number);
-      break;
-#pragma warning(suppress : 4065)
+  auto processor = reinterpret_cast<Processor*>(arg0);
+  const uint32_t address = static_cast<uint32_t>(ppc_context->scratch);
+  if (processor->HandleSyscall(ppc_context, address)) {
+    return;
   }
+  XELOGE("Unhandled syscall {} at {:08X}!", ppc_context->r[0], address);
+}
+
+// icbi: the guest is publishing new instructions in this 128-byte line, so any
+// translation of it is stale (only emitted with --guest_code_generation).
+void InvalidateIcacheLine(PPCContext* ppc_context, void* arg0, void* arg1) {
+  auto processor = reinterpret_cast<Processor*>(arg0);
+  const uint32_t line = uint32_t(ppc_context->scratch) & ~uint32_t(127);
+  processor->InvalidateGuestCode(line, 128);
 }
 
 bool PPCFrontend::Initialize() {
@@ -101,7 +109,9 @@ bool PPCFrontend::Initialize() {
   builtins_.leave_global_lock =
       processor_->DefineBuiltin("LeaveGlobalLock", LeaveGlobalLock, arg0, arg1);
   builtins_.syscall_handler = processor_->DefineBuiltin(
-      "SyscallHandler", SyscallHandler, nullptr, nullptr);
+      "SyscallHandler", SyscallHandler, processor_, nullptr);
+  builtins_.invalidate_icache_line = processor_->DefineBuiltin(
+      "InvalidateIcacheLine", InvalidateIcacheLine, processor_, nullptr);
   return true;
 }
 

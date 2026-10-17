@@ -39,7 +39,16 @@ uint64_t PPCContext::cr() const {
 }
 
 void PPCContext::set_cr(uint64_t value) {
-  assert_always("not yet implemented");
+  // Inverse of cr(): one field per nibble, cr0 in the most significant one,
+  // stored as the lt/gt/eq/so bytes the generated code reads.
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t bits = uint32_t(value >> ((7 - i) * 4)) & 0xF;
+    auto field = reinterpret_cast<uint8_t*>(&cr0.value + i);
+    field[0] = (bits >> 3) & 1;  // lt
+    field[1] = (bits >> 2) & 1;  // gt
+    field[2] = (bits >> 1) & 1;  // eq
+    field[3] = bits & 1;         // so
+  }
 }
 
 std::string PPCContext::GetRegisterName(PPCRegister reg) {

@@ -658,6 +658,10 @@ void A64Backend::CommitExecutableRange(uint32_t guest_low,
   code_cache_->CommitExecutableRange(guest_low, guest_high);
 }
 
+void A64Backend::ResetIndirection(uint32_t guest_address) {
+  code_cache_->ResetIndirection(guest_address);
+}
+
 std::unique_ptr<Assembler> A64Backend::CreateAssembler() {
   return std::make_unique<A64Assembler>(this);
 }
@@ -748,6 +752,25 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
 void A64Backend::PrepareForReentry(void* ctx) {
   auto* a64_ctx = BackendContextForGuestContext(ctx);
   a64_ctx->current_stackpoint_depth = 0;
+}
+
+uint32_t A64Backend::EnterNestedGuestStack(void* ctx) {
+  auto* a64_ctx = BackendContextForGuestContext(ctx);
+  const uint32_t depth = a64_ctx->current_stackpoint_depth;
+  if (a64_ctx->stackpoints && depth < uint32_t(cvars::a64_max_stackpoints)) {
+    // A guest stack pointer is never above this, so longjmp detection stops
+    // here instead of matching the frames that entered the nested stack.
+    A64BackendStackpoint& barrier = a64_ctx->stackpoints[depth];
+    barrier.host_stack_ = 0;
+    barrier.guest_stack_ = 0xFFFFFFFFu;
+    barrier.guest_return_address_ = 0;
+    a64_ctx->current_stackpoint_depth = depth + 1;
+  }
+  return depth;
+}
+
+void A64Backend::LeaveNestedGuestStack(void* ctx, uint32_t saved_state) {
+  BackendContextForGuestContext(ctx)->current_stackpoint_depth = saved_state;
 }
 
 uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,

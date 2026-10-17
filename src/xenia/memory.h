@@ -10,6 +10,7 @@
 #ifndef XENIA_MEMORY_H_
 #define XENIA_MEMORY_H_
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@
 #include "xenia/guest_pointers.h"
 namespace xe {
 class ByteStream;
+class Exception;
 }  // namespace xe
 
 namespace xe {
@@ -623,7 +625,39 @@ class Memory {
   void SetMMIOExceptionRecordingCallback(cpu::MmioAccessRecordCallback callback,
                                          void* context);
 
+  // A second guest address space, laid out like virtual_membase() but with no
+  // pages of its own: each page is bound on first access to the backing of
+  // existing guest memory, as chosen by a resolver - a software TLB refill.
+  // The kernel runs user-mode code (KeEnterUserMode) in it, because user mode
+  // has its own page table.
+  struct AliasSpacePage {
+    // Page in the alias space (guest address and size, a power of two).
+    uint32_t guest_address;
+    uint32_t length;
+    // What it shows: guest physical memory, or the same bytes as a guest
+    // virtual address of the main address space.
+    bool source_is_physical;
+    uint32_t source_address;
+  };
+  // Called (possibly from an exception handler) for an unbound address.
+  typedef bool (*AliasSpaceResolver)(void* context, uint32_t guest_address,
+                                     AliasSpacePage* out_page);
+  // Returns the host base of the alias space (to be used as a membase), or
+  // nullptr if the host does not support it. Only one may exist.
+  uint8_t* CreateAliasSpace(AliasSpaceResolver resolver, void* context);
+  uint8_t* alias_space_membase() const { return alias_membase_.load(); }
+  // Unbinds the pages overlapping the range; they are resolved again on
+  // their next access.
+  void InvalidateAliasSpace(uint32_t guest_address, uint32_t length);
+  void InvalidateAliasSpace();
+
  private:
+  static bool AliasSpaceExceptionCallbackThunk(Exception* ex, void* data);
+  bool BindAliasSpaceAddress(uint64_t host_offset);
+  uint64_t AliasSpaceHostOffset(uint32_t guest_address) const;
+  bool GetBackingOffset(const AliasSpacePage& page, uint32_t guest_address,
+                        uint64_t* out_offset) const;
+
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
 
@@ -661,6 +695,13 @@ class Memory {
   } views_ = {{0}};
 
   std::unique_ptr<cpu::MMIOHandler> mmio_handler_;
+
+  std::atomic<uint8_t*> alias_membase_{nullptr};
+  AliasSpaceResolver alias_resolver_ = nullptr;
+  void* alias_resolver_context_ = nullptr;
+  std::mutex alias_mutex_;
+  // Bound views in the alias space: host offset -> length.
+  std::map<uint64_t, uint64_t> alias_views_;
 
   struct {
     VirtualHeap v00000000;

@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/base/logging.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -752,6 +754,16 @@ dword_result_t KeGetImagePageTableEntry_entry(dword_t address,
     // now there is not enough data, but dashboard 14xxx and above requires that
     // return from this call will have bit 0 set.
     returned_value |= 1;
+  } else {
+    // The low bits are the PTE's protection: PP (0b11 read-only, 0b10
+    // read/write) and N (bit 2, no-execute). The XNA runtime host checks them
+    // for each page of NetCFUserMode.dll before mapping it into user mode and
+    // gives up on a page that reports neither. Xenia does not track execute
+    // permission, so read-only pages are reported as code.
+    uint32_t protect = 0;
+    image_heap->QueryProtect(address, &protect);
+    returned_value =
+        (returned_value << 3) | ((protect & kMemoryProtectWrite) ? 0x6 : 0x3);
   }
 
   return returned_value & 0x400FFFFF;  // this is actually the mask it applies
@@ -813,6 +825,72 @@ dword_result_t MmIsAddressValid_entry(dword_t address,
 }
 
 DECLARE_XBOXKRNL_EXPORT1(MmIsAddressValid, kMemory, kImplemented);
+
+// Cache maintenance. Xenia has no caches to maintain, but a title that
+// generates code at runtime (the .NET CF JIT inside the XNA host) uses these
+// to publish new instructions, so they are the signal to drop any stale
+// translation of the range (only while --guest_code_generation is enabled).
+static void InvalidateGuestCodeRange(uint32_t address, uint32_t length) {
+  if (!cvars::guest_code_generation || !length) {
+    return;
+  }
+  kernel_state()->processor()->InvalidateGuestCode(address, length);
+}
+
+// NT on PowerPC declares VOID KeSweepIcacheRange(BOOLEAN AllProcessors,
+// PVOID BaseAddress, ULONG Length). The Xbox 360 prototype is not public, so
+// accept that form as well as (BaseAddress, Length).
+void KeSweepIcacheRange_entry(dword_t arg0, dword_t arg1, dword_t arg2) {
+  uint32_t address = arg0;
+  uint32_t length = arg1;
+  if (arg0 <= 1 && arg1 >= 0x10000) {
+    address = arg1;
+    length = arg2;
+  }
+  InvalidateGuestCodeRange(address, length);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSweepIcacheRange, kMemory, kImplemented);
+
+void KeSweepDcacheRange_entry(dword_t arg0, dword_t arg1, dword_t arg2) {
+  // Data cache only; nothing to do.
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSweepDcacheRange, kMemory, kImplemented);
+
+void KeFlushCacheRange_entry(lpvoid_t address, dword_t length) {
+  // Write back + invalidate for both caches.
+  InvalidateGuestCodeRange(address.guest_address(), length);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeFlushCacheRange, kMemory, kImplemented);
+
+// XexReserveCodeBuffer (0x36B) / XexCommitCodeBuffer (0x36C) are the only
+// kernel exports that can give a retail title executable memory (the
+// hypervisor will not make ordinary pages executable), so a JIT host such as
+// the XNA runtime is expected to use them. Their prototypes are not public:
+// log every argument register so they can be reverse engineered from a real
+// caller before an implementation is written.
+dword_result_t XexReserveCodeBuffer_entry(dword_t r3, dword_t r4, dword_t r5,
+                                          dword_t r6, dword_t r7,
+                                          const ppc_context_t& ctx) {
+  XELOGE(
+      "XexReserveCodeBuffer(r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, "
+      "r7={:08X}) lr={:08X} - not implemented",
+      uint32_t(r3), uint32_t(r4), uint32_t(r5), uint32_t(r6), uint32_t(r7),
+      uint32_t(ctx->lr));
+  return X_STATUS_NOT_IMPLEMENTED;
+}
+DECLARE_XBOXKRNL_EXPORT2(XexReserveCodeBuffer, kMemory, kStub, kImportant);
+
+dword_result_t XexCommitCodeBuffer_entry(dword_t r3, dword_t r4, dword_t r5,
+                                         dword_t r6, dword_t r7,
+                                         const ppc_context_t& ctx) {
+  XELOGE(
+      "XexCommitCodeBuffer(r3={:08X}, r4={:08X}, r5={:08X}, r6={:08X}, "
+      "r7={:08X}) lr={:08X} - not implemented",
+      uint32_t(r3), uint32_t(r4), uint32_t(r5), uint32_t(r6), uint32_t(r7),
+      uint32_t(ctx->lr));
+  return X_STATUS_NOT_IMPLEMENTED;
+}
+DECLARE_XBOXKRNL_EXPORT2(XexCommitCodeBuffer, kMemory, kStub, kImportant);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

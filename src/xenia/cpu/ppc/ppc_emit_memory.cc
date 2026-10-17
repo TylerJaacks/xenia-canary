@@ -12,7 +12,9 @@
 #include <stddef.h>
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/ppc/ppc_frontend.h"
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
 DEFINE_bool(
@@ -1177,8 +1179,17 @@ int InstrEmit_dcbz(PPCHIRBuilder& f, const InstrData& i) {
 }
 
 int InstrEmit_icbi(PPCHIRBuilder& f, const InstrData& i) {
-  // XEINSTRNOTIMPLEMENTED();
-  f.Nop();
+  if (!cvars::guest_code_generation) {
+    // Code never changes underneath us for ordinary titles.
+    f.Nop();
+    return 0;
+  }
+  // EA <- (RA|0) + (RB); invalidate the instruction cache line holding EA.
+  // A JIT writes code, then icbi + isync before running it, so this is where
+  // stale translations of that line must be dropped.
+  Value* ea = CalculateEA_0(f, i.X.RA, i.X.RB);
+  f.StoreContext(offsetof(PPCContext, scratch), ea);
+  f.CallExtern(f.builtins()->invalidate_icache_line);
   return 0;
 }
 
