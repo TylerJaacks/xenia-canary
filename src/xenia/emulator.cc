@@ -715,13 +715,20 @@ X_STATUS Emulator::LaunchXnaGame(const std::filesystem::path& path,
   XELOGI("  Virtual title ID: {}", info.virtual_title_id);
 
   if (cvars::xna_host_path.empty()) {
-    XELOGE(
-        "This package is an Xbox Live Indie Game. It contains only .NET "
-        "Compact Framework assemblies (no default.xex), which the console runs "
-        "through its XNA host executable (title 584E07D2 plus its title "
-        "update). Set xna_host_path to a copy of that executable dumped from "
-        "your console.");
-    return X_STATUS_NOT_SUPPORTED;
+    const std::filesystem::path default_xna_title_launcher = std::filesystem::current_path() /=
+        std::string("Xna_TitleLauncher.xex");
+
+   if (std::filesystem::exists(default_xna_title_launcher)) {
+      cvars::xna_host_path = default_xna_title_launcher;
+   } else {
+     XELOGE(
+         "This package is an Xbox Live Indie Game. It contains only .NET "
+         "Compact Framework assemblies (no default.xex), which the console "
+         "runs through its XNA host executable (title 584E07D2 plus its title "
+         "update).");
+
+     return X_STATUS_NOT_SUPPORTED;
+   }
   }
 
   // Resolve relative paths against the working directory: the host is
